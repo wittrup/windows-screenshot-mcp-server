@@ -1097,7 +1097,11 @@ func (s *Server) handleMCPProtocolToolsList(c *gin.Context, req *types.MCPReques
 					},
 					"window_title": map[string]interface{}{
 						"type":        "string",
-						"description": "If provided, x/y are relative to this window's client area and the window is brought to the foreground first",
+						"description": "If provided, x/y are relative to this window. Uses FindWindowW (may be unreliable on secondary monitors)",
+					},
+					"window_handle": map[string]interface{}{
+						"type":        "string",
+						"description": "Window handle number from list_windows. Most reliable targeting method, especially on multi-monitor setups. Takes priority over window_title.",
 					},
 				},
 				"required": []string{"x", "y"},
@@ -1458,9 +1462,26 @@ func (s *Server) mcpToolMouseClick(c *gin.Context, req *types.MCPRequest, args m
 	button := getString(args, "button", "left")
 	clickType := getString(args, "click_type", "single")
 	windowTitle := getString(args, "window_title", "")
+	windowHandleStr := getString(args, "window_handle", "")
 
 	var windowHandle uintptr
-	if windowTitle != "" {
+	var targetDesc string
+
+	if windowHandleStr != "" {
+		// Direct handle — most reliable, especially on multi-monitor
+		if h, parseErr := strconv.ParseUint(windowHandleStr, 10, 64); parseErr == nil {
+			windowHandle = uintptr(h)
+			targetDesc = fmt.Sprintf("handle %s", windowHandleStr)
+		} else {
+			s.sendMCPResult(c, req.ID, map[string]interface{}{
+				"isError": true,
+				"content": []map[string]interface{}{
+					{"type": "text", "text": fmt.Sprintf("Invalid handle: %s", windowHandleStr)},
+				},
+			})
+			return
+		}
+	} else if windowTitle != "" {
 		handle, err := s.engine.FindWindowHandle("title", windowTitle)
 		if err != nil {
 			s.sendMCPResult(c, req.ID, map[string]interface{}{
@@ -1472,6 +1493,7 @@ func (s *Server) mcpToolMouseClick(c *gin.Context, req *types.MCPRequest, args m
 			return
 		}
 		windowHandle = handle
+		targetDesc = fmt.Sprintf("'%s'", windowTitle)
 	}
 
 	err := s.engine.ClickMouse(x, y, button, clickType, windowHandle)
@@ -1486,18 +1508,16 @@ func (s *Server) mcpToolMouseClick(c *gin.Context, req *types.MCPRequest, args m
 	}
 
 	coordDesc := fmt.Sprintf("screen (%d,%d)", x, y)
-	mode := "physical"
-	if windowTitle != "" {
-		coordDesc = fmt.Sprintf("window '%s' client (%d,%d)", windowTitle, x, y)
-		mode = "stealth (PostMessage)"
+	if targetDesc != "" {
+		coordDesc = fmt.Sprintf("window %s (%d,%d)", targetDesc, x, y)
 	}
 
 	s.sendMCPResult(c, req.ID, map[string]interface{}{
 		"content": []map[string]interface{}{
 			{
 				"type": "text",
-				"text": fmt.Sprintf("%s %s-click at %s [%s]",
-					button, clickType, coordDesc, mode),
+				"text": fmt.Sprintf("%s %s-click at %s",
+					button, clickType, coordDesc),
 			},
 		},
 	})
