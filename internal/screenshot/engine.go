@@ -895,8 +895,8 @@ func (e *WindowsScreenshotEngine) clickMouseTargeted(x, y int, button, clickType
 	setForegroundWindow.Call(hwnd)
 	time.Sleep(100 * time.Millisecond)
 
-	// Move, click, restore
-	setCursorPos.Call(uintptr(screenX), uintptr(screenY))
+	// Move, click, restore (int32ToUintptr for negative multi-monitor coords)
+	setCursorPos.Call(int32ToUintptr(screenX), int32ToUintptr(screenY))
 	time.Sleep(30 * time.Millisecond)
 
 	var downFlag, upFlag uint32
@@ -930,7 +930,7 @@ func (e *WindowsScreenshotEngine) clickMouseTargeted(x, y int, button, clickType
 
 	// Restore cursor to original position
 	time.Sleep(30 * time.Millisecond)
-	setCursorPos.Call(uintptr(savedPos.X), uintptr(savedPos.Y))
+	setCursorPos.Call(int32ToUintptr(int(savedPos.X)), int32ToUintptr(int(savedPos.Y)))
 
 	return nil
 }
@@ -1025,7 +1025,7 @@ func (e *WindowsScreenshotEngine) clickMouseStealth(x, y int, button, clickType 
 
 // clickMousePhysical uses SetCursorPos + SendInput — moves the real cursor.
 func (e *WindowsScreenshotEngine) clickMousePhysical(x, y int, button, clickType string) error {
-	ret, _, _ := setCursorPos.Call(uintptr(x), uintptr(y))
+	ret, _, _ := setCursorPos.Call(int32ToUintptr(x), int32ToUintptr(y))
 	if ret == 0 {
 		return fmt.Errorf("SetCursorPos failed")
 	}
