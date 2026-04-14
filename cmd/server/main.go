@@ -1472,10 +1472,6 @@ func (s *Server) mcpToolMouseClick(c *gin.Context, req *types.MCPRequest, args m
 			return
 		}
 		windowHandle = handle
-
-		// Bring window to foreground before clicking
-		s.engine.ControlWindow(handle, "focus", 0, 0, 0, 0)
-		time.Sleep(200 * time.Millisecond)
 	}
 
 	err := s.engine.ClickMouse(x, y, button, clickType, windowHandle)
@@ -1490,16 +1486,18 @@ func (s *Server) mcpToolMouseClick(c *gin.Context, req *types.MCPRequest, args m
 	}
 
 	coordDesc := fmt.Sprintf("screen (%d,%d)", x, y)
+	mode := "physical"
 	if windowTitle != "" {
 		coordDesc = fmt.Sprintf("window '%s' client (%d,%d)", windowTitle, x, y)
+		mode = "stealth (PostMessage)"
 	}
 
 	s.sendMCPResult(c, req.ID, map[string]interface{}{
 		"content": []map[string]interface{}{
 			{
 				"type": "text",
-				"text": fmt.Sprintf("%s %s-click at %s",
-					button, clickType, coordDesc),
+				"text": fmt.Sprintf("%s %s-click at %s [%s]",
+					button, clickType, coordDesc, mode),
 			},
 		},
 	})

@@ -818,37 +818,74 @@ func (e *WindowsScreenshotEngine) FindWindowByPIDPublic(pid uint32) (uintptr, er
 	return e.findWindowByPID(pid)
 }
 
-// ClickMouse performs a mouse click at screen-absolute or window-relative coordinates.
-// button: "left", "right", "middle"
-// clickType: "single", "double"
-// If windowHandle != 0 the x,y are relative to the window's client area.
+// ClickMouse performs a mouse click.
+// When windowHandle != 0, uses PostMessage to send synthetic WM_*BUTTON messages
+// directly to the window — does NOT move the physical cursor (stealth/non-interfering).
+// When windowHandle == 0, falls back to SetCursorPos + SendInput (screen-absolute).
 func (e *WindowsScreenshotEngine) ClickMouse(x, y int, button, clickType string, windowHandle uintptr) error {
-	// Convert window-relative to screen-absolute if needed
-	screenX, screenY := int32(x), int32(y)
 	if windowHandle != 0 {
-		pt := POINT{X: int32(x), Y: int32(y)}
-		ret, _, _ := clientToScreen.Call(windowHandle, uintptr(unsafe.Pointer(&pt)))
-		if ret == 0 {
-			return fmt.Errorf("ClientToScreen failed")
-		}
-		screenX, screenY = pt.X, pt.Y
+		return e.clickMouseStealth(x, y, button, clickType, windowHandle)
+	}
+	return e.clickMousePhysical(x, y, button, clickType)
+}
+
+// clickMouseStealth sends WM_*BUTTON messages via PostMessage — no cursor movement.
+func (e *WindowsScreenshotEngine) clickMouseStealth(x, y int, button, clickType string, hwnd uintptr) error {
+	lParam := uintptr((y << 16) | (x & 0xFFFF))
+
+	var downMsg, upMsg, dblMsg uintptr
+	var wParamDown uintptr
+	switch button {
+	case "right":
+		downMsg = WM_RBUTTONDOWN
+		upMsg = WM_RBUTTONUP
+		dblMsg = WM_RBUTTONDBLCLK
+		wParamDown = MK_RBUTTON
+	case "middle":
+		downMsg = WM_MBUTTONDOWN
+		upMsg = WM_MBUTTONUP
+		dblMsg = WM_MBUTTONDBLCLK
+		wParamDown = MK_MBUTTON
+	default: // "left"
+		downMsg = WM_LBUTTONDOWN
+		upMsg = WM_LBUTTONUP
+		dblMsg = WM_LBUTTONDBLCLK
+		wParamDown = MK_LBUTTON
 	}
 
-	// Move cursor
-	ret, _, _ := setCursorPos.Call(uintptr(screenX), uintptr(screenY))
+	if clickType == "double" {
+		// Double-click sequence: down, up, dblclk, up
+		postMessage.Call(hwnd, downMsg, wParamDown, lParam)
+		time.Sleep(20 * time.Millisecond)
+		postMessage.Call(hwnd, upMsg, 0, lParam)
+		time.Sleep(20 * time.Millisecond)
+		postMessage.Call(hwnd, dblMsg, wParamDown, lParam)
+		time.Sleep(20 * time.Millisecond)
+		postMessage.Call(hwnd, upMsg, 0, lParam)
+	} else {
+		postMessage.Call(hwnd, downMsg, wParamDown, lParam)
+		time.Sleep(20 * time.Millisecond)
+		postMessage.Call(hwnd, upMsg, 0, lParam)
+	}
+
+	return nil
+}
+
+// clickMousePhysical uses SetCursorPos + SendInput — moves the real cursor.
+func (e *WindowsScreenshotEngine) clickMousePhysical(x, y int, button, clickType string) error {
+	ret, _, _ := setCursorPos.Call(uintptr(x), uintptr(y))
 	if ret == 0 {
 		return fmt.Errorf("SetCursorPos failed")
 	}
 	time.Sleep(50 * time.Millisecond)
 
-	// Determine button flags
 	var downFlag, upFlag uint32
 	switch button {
 	case "right":
 		downFlag, upFlag = MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP
 	case "middle":
 		downFlag, upFlag = MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP
-	default: // "left"
+	default:
 		downFlag, upFlag = MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP
 	}
 
@@ -858,14 +895,11 @@ func (e *WindowsScreenshotEngine) ClickMouse(x, y int, button, clickType string,
 	}
 
 	for i := 0; i < clicks; i++ {
-		// Mouse down
 		inputDown := INPUT{Type: INPUT_MOUSE}
 		inputDown.Mi.DwFlags = downFlag
 		sendInput.Call(1, uintptr(unsafe.Pointer(&inputDown)), unsafe.Sizeof(inputDown))
-
 		time.Sleep(20 * time.Millisecond)
 
-		// Mouse up
 		inputUp := INPUT{Type: INPUT_MOUSE}
 		inputUp.Mi.DwFlags = upFlag
 		sendInput.Call(1, uintptr(unsafe.Pointer(&inputUp)), unsafe.Sizeof(inputUp))
@@ -894,7 +928,7 @@ const (
 	SWP_NOSIZE       = 0x0001
 	HWND_TOP         = 0
 
-	// SendInput / mouse constants
+	// SendInput / mouse constants (physical fallback)
 	INPUT_MOUSE           = 0
 	MOUSEEVENTF_MOVE      = 0x0001
 	MOUSEEVENTF_LEFTDOWN  = 0x0002
@@ -906,6 +940,20 @@ const (
 	MOUSEEVENTF_ABSOLUTE  = 0x8000
 	SM_CXSCREEN           = 0
 	SM_CYSCREEN           = 1
+
+	// WM_*BUTTON message constants (stealth PostMessage click)
+	WM_LBUTTONDOWN   = 0x0201
+	WM_LBUTTONUP     = 0x0202
+	WM_LBUTTONDBLCLK = 0x0203
+	WM_RBUTTONDOWN   = 0x0204
+	WM_RBUTTONUP     = 0x0205
+	WM_RBUTTONDBLCLK = 0x0206
+	WM_MBUTTONDOWN   = 0x0207
+	WM_MBUTTONUP     = 0x0208
+	WM_MBUTTONDBLCLK = 0x0209
+	MK_LBUTTON       = 0x0001
+	MK_RBUTTON       = 0x0002
+	MK_MBUTTON       = 0x0010
 )
 
 // POINT structure for GetCursorPos
