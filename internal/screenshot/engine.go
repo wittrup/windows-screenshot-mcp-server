@@ -429,9 +429,11 @@ func (e *WindowsScreenshotEngine) tryPrintWindow(handle uintptr, windowInfo *typ
 	defer selectObject.Call(memDC, oldBitmap)
 	
 	// Use PrintWindow to render to our DC
-	flags := uintptr(0)
+	// PW_RENDERFULLCONTENT (0x2) forces rendering of hardware-accelerated
+	// content (OpenGL, DirectX) into the DC — critical for Qt 3D views.
+	flags := uintptr(PW_RENDERFULLCONTENT)
 	if !options.IncludeFrame {
-		flags = PW_CLIENTONLY
+		flags |= PW_CLIENTONLY
 	}
 	
 	ret, _, _ := printWindow.Call(handle, memDC, flags)
