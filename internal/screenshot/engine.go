@@ -734,6 +734,15 @@ func absInt(v int) int {
 	return v
 }
 
+// int32ToUintptr converts an int to a uintptr preserving the bit pattern of
+// the int32 representation, WITHOUT 64-bit sign extension.
+// This is required when passing negative coordinates (e.g. -1920 for a
+// secondary monitor) to Win32 APIs via syscall.Call on 64-bit Go.
+func int32ToUintptr(v int) uintptr {
+	i32 := int32(v)
+	return uintptr(*(*uint32)(unsafe.Pointer(&i32)))
+}
+
 // ListVisibleWindows enumerates all visible windows with titles
 func (e *WindowsScreenshotEngine) ListVisibleWindows() ([]types.WindowInfo, error) {
 	var windows []types.WindowInfo
@@ -773,29 +782,19 @@ func (e *WindowsScreenshotEngine) ControlWindow(handle uintptr, action string, x
 		setForegroundWindow.Call(handle)
 		showWindow.Call(handle, SW_RESTORE)
 	case "move":
-		// Keep current size, move to x,y
-		// Use int32 cast to preserve sign for negative multi-monitor coordinates
+		// Use SetWindowPos — handles negative multi-monitor coordinates correctly.
+		// MoveWindow via uintptr sign-extends negative int32 to 64-bit, breaking on x64.
 		var rect RECT
 		getWindowRect.Call(handle, uintptr(unsafe.Pointer(&rect)))
-		curW := int32(rect.Right - rect.Left)
-		curH := int32(rect.Bottom - rect.Top)
-		ret, _, _ := moveWindow.Call(handle, uintptr(int32(x)), uintptr(int32(y)), uintptr(curW), uintptr(curH), 1)
-		if ret == 0 {
-			return nil, fmt.Errorf("MoveWindow failed")
-		}
+		cx := int(rect.Right - rect.Left)
+		cy := int(rect.Bottom - rect.Top)
+		e.setWindowPosHelper(handle, x, y, cx, cy)
 	case "resize":
-		// Keep current position, change size
 		var rect RECT
 		getWindowRect.Call(handle, uintptr(unsafe.Pointer(&rect)))
-		ret, _, _ := moveWindow.Call(handle, uintptr(rect.Left), uintptr(rect.Top), uintptr(int32(width)), uintptr(int32(height)), 1)
-		if ret == 0 {
-			return nil, fmt.Errorf("MoveWindow failed")
-		}
+		e.setWindowPosHelper(handle, int(rect.Left), int(rect.Top), width, height)
 	case "move_resize":
-		ret, _, _ := moveWindow.Call(handle, uintptr(int32(x)), uintptr(int32(y)), uintptr(int32(width)), uintptr(int32(height)), 1)
-		if ret == 0 {
-			return nil, fmt.Errorf("MoveWindow failed")
-		}
+		e.setWindowPosHelper(handle, x, y, width, height)
 	default:
 		return nil, fmt.Errorf("unsupported action: %s", action)
 	}
@@ -805,6 +804,23 @@ func (e *WindowsScreenshotEngine) ControlWindow(handle uintptr, action string, x
 
 	// Return updated window info
 	return e.getWindowInfo(handle)
+}
+
+// setWindowPosHelper uses SetWindowPos via a temporary RECT to pass signed coordinates
+// correctly on 64-bit Windows. Direct uintptr casts of negative ints break MoveWindow.
+func (e *WindowsScreenshotEngine) setWindowPosHelper(handle uintptr, x, y, cx, cy int) {
+	// Pack into a RECT and use the raw syscall with proper 32-bit values
+	// SetWindowPos(hWnd, hWndInsertAfter, X, Y, cx, cy, uFlags)
+	// We use SWP_NOZORDER | SWP_NOACTIVATE to avoid Z-order/focus changes
+	setWindowPos.Call(
+		handle,
+		0, // HWND_TOP
+		int32ToUintptr(x),
+		int32ToUintptr(y),
+		uintptr(cx),
+		uintptr(cy),
+		SWP_NOZORDER|SWP_NOACTIVATE,
+	)
 }
 
 // FindWindowHandle resolves a window handle from method+target (same as capture)

@@ -418,9 +418,10 @@ func (e *WindowsScreenshotEngine) captureFromScreenDC(handle uintptr, windowInfo
 	defer selectObject.Call(memDC, oldBitmap)
 
 	// BitBlt from screen DC at the window's absolute screen position
+	// Use int32ToUintptr to avoid 64-bit sign extension of negative coordinates
 	ret, _, _ := bitBlt.Call(
 		memDC, 0, 0, uintptr(width), uintptr(height),
-		screenDC, uintptr(int32(rect.Left)), uintptr(int32(rect.Top)), SRCCOPY,
+		screenDC, int32ToUintptr(int(rect.Left)), int32ToUintptr(int(rect.Top)), SRCCOPY,
 	)
 	if ret == 0 {
 		return nil, fmt.Errorf("BitBlt from screen DC failed")
