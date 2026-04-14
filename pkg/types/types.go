@@ -187,10 +187,16 @@ type ScreenshotEngine interface {
 	CaptureWithFallbacks(handle uintptr, options *CaptureOptions) (*ScreenshotBuffer, error)
 	
 	// Window discovery methods
+	ListVisibleWindows() ([]WindowInfo, error)
 	EnumerateAllProcessWindows(pid uint32) ([]WindowInfo, error)
 	FindSystemTrayApps() ([]WindowInfo, error)
 	FindHiddenWindows() ([]WindowInfo, error)
 	FindCloakedWindows() ([]WindowInfo, error)
+
+	// Window control methods
+	ControlWindow(handle uintptr, action string, x, y, width, height int) (*WindowInfo, error)
+	FindWindowHandle(method, target string) (uintptr, error)
+	FindWindowByPIDPublic(pid uint32) (uintptr, error)
 }
 
 // WindowManager defines window management operations

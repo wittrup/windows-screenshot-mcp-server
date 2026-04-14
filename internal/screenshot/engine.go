@@ -3,6 +3,7 @@ package screenshot
 import (
 	"fmt"
 	"runtime"
+	"strings"
 	"syscall"
 	"time"
 	"unsafe"
@@ -17,6 +18,7 @@ var (
 	gdi32     = windows.NewLazyDLL("gdi32.dll")
 	dwmapi    = windows.NewLazyDLL("dwmapi.dll")
 	shcore    = windows.NewLazyDLL("shcore.dll")
+	kernel32  = windows.NewLazyDLL("kernel32.dll")
 	
 	// User32 functions
 	findWindowW           = user32.NewProc("FindWindowW")
@@ -36,6 +38,11 @@ var (
 	getWindowThreadProcessId = user32.NewProc("GetWindowThreadProcessId")
 	enumWindows           = user32.NewProc("EnumWindows")
 	getClassName          = user32.NewProc("GetClassNameW")
+
+	// Window control functions
+	setForegroundWindow   = user32.NewProc("SetForegroundWindow")
+	moveWindow            = user32.NewProc("MoveWindow")
+	setWindowPos          = user32.NewProc("SetWindowPos")
 	
 	// GDI32 functions
 	createCompatibleDC    = gdi32.NewProc("CreateCompatibleDC")
@@ -55,6 +62,9 @@ var (
 	// ShCore functions (for DPI awareness)
 	setProcessDpiAwareness = shcore.NewProc("SetProcessDpiAwareness")
 	getDpiForMonitor       = shcore.NewProc("GetDpiForMonitor")
+
+	// Kernel32 functions
+	closeHandle = kernel32.NewProc("CloseHandle")
 )
 
 // Windows API constants
@@ -66,6 +76,7 @@ const (
 	PW_RENDERFULLCONTENT = 2
 	SW_RESTORE          = 9
 	SW_SHOW             = 5
+	SW_MINIMIZE         = 6
 	LOGPIXELSX          = 88
 	LOGPIXELSY          = 90
 	DWMWA_EXTENDED_FRAME_BOUNDS = 9
@@ -141,9 +152,7 @@ func (e *WindowsScreenshotEngine) enableDPIAwareness() error {
 
 // CaptureByHandle captures a screenshot of a window by its handle
 func (e *WindowsScreenshotEngine) CaptureByHandle(handle uintptr, options *types.CaptureOptions) (*types.ScreenshotBuffer, error) {
-	if options == nil {
-		options = types.DefaultCaptureOptions()
-	}
+	options = e.normalizeCaptureOptions(options)
 	
 	startTime := time.Now()
 	
@@ -171,12 +180,20 @@ func (e *WindowsScreenshotEngine) CaptureByHandle(handle uintptr, options *types
 	
 	// Capture the screenshot
 	var buffer *types.ScreenshotBuffer
-	if isMinimized && options.AllowMinimized && !options.RestoreWindow {
-		// Use DWM/PrintWindow for minimized windows
-		buffer, err = e.captureMinimizedWindow(handle, windowInfo, options)
+	if e.shouldPreferFallbackCapture(windowInfo, options) {
+		buffer, err = e.captureWithRetryFallbacks(handle, windowInfo, options)
 	} else {
-		// Use BitBlt for visible windows
-		buffer, err = e.captureVisibleWindow(handle, windowInfo, options)
+		if isMinimized && options.AllowMinimized && !options.RestoreWindow {
+			// Use DWM/PrintWindow for minimized windows
+			buffer, err = e.captureMinimizedWindow(handle, windowInfo, options)
+		} else {
+			// Use BitBlt for visible windows
+			buffer, err = e.captureVisibleWindow(handle, windowInfo, options)
+		}
+
+		if err == nil && e.isLikelyBlankCapture(buffer) {
+			buffer, err = e.captureWithRetryFallbacks(handle, windowInfo, options)
+		}
 	}
 	
 	if err != nil {
@@ -255,10 +272,16 @@ func (e *WindowsScreenshotEngine) captureVisibleWindow(handle uintptr, windowInf
 	}
 	defer releaseDC.Call(handle, hdc)
 	
-	// Determine capture dimensions
+	// Determine capture dimensions and source origin.
+	// Window DC coordinates are relative to the window/client origin rather than
+	// absolute screen coordinates, so the default capture source is (0,0).
 	var rect types.Rectangle
+	sourceX := 0
+	sourceY := 0
 	if options.Region != nil {
 		rect = *options.Region
+		sourceX = rect.X
+		sourceY = rect.Y
 	} else if options.IncludeFrame {
 		rect = windowInfo.Rect
 	} else {
@@ -299,7 +322,7 @@ func (e *WindowsScreenshotEngine) captureVisibleWindow(handle uintptr, windowInf
 	// Copy pixels from window to memory DC
 	ret, _, _ := bitBlt.Call(
 		memDC, 0, 0, uintptr(rect.Width), uintptr(rect.Height),
-		hdc, uintptr(rect.X), uintptr(rect.Y), SRCCOPY,
+		hdc, uintptr(sourceX), uintptr(sourceY), SRCCOPY,
 	)
 	
 	if ret == 0 {
@@ -552,12 +575,257 @@ func (e *WindowsScreenshotEngine) restoreWindow(handle uintptr) error {
 	return nil
 }
 
+func (e *WindowsScreenshotEngine) normalizeCaptureOptions(options *types.CaptureOptions) *types.CaptureOptions {
+	if options == nil {
+		return types.DefaultCaptureOptions()
+	}
+
+	normalized := *options
+	if normalized.WaitForVisible == 0 {
+		normalized.WaitForVisible = 2 * time.Second
+	}
+	if normalized.RetryCount == 0 {
+		normalized.RetryCount = 3
+	}
+	if normalized.PreferredMethod == "" {
+		normalized.PreferredMethod = types.CaptureAuto
+	}
+	if normalized.FallbackMethods == nil {
+		normalized.FallbackMethods = []types.CaptureMethod{
+			types.CapturePrintWindow,
+			types.CaptureWMPrint,
+			types.CaptureDWMThumbnail,
+			types.CaptureStealthRestore,
+		}
+	}
+	if normalized.CustomProperties == nil {
+		normalized.CustomProperties = make(map[string]string)
+	}
+
+	return &normalized
+}
+
+func (e *WindowsScreenshotEngine) shouldPreferFallbackCapture(windowInfo *types.WindowInfo, options *types.CaptureOptions) bool {
+	if windowInfo == nil || options == nil {
+		return false
+	}
+
+	className := strings.ToLower(windowInfo.ClassName)
+	if strings.HasPrefix(className, "qt") {
+		return true
+	}
+	if windowInfo.State != "visible" {
+		return true
+	}
+	if options.UseDWMThumbnails || options.ForceRender {
+		return true
+	}
+	if options.PreferredMethod != "" && options.PreferredMethod != types.CaptureAuto {
+		return true
+	}
+
+	return false
+}
+
+func (e *WindowsScreenshotEngine) preferredRetryMethod(windowInfo *types.WindowInfo) types.CaptureMethod {
+	if windowInfo == nil {
+		return types.CapturePrintWindow
+	}
+
+	className := strings.ToLower(windowInfo.ClassName)
+	switch {
+	case strings.HasPrefix(className, "qt"):
+		return types.CapturePrintWindow
+	case windowInfo.State == "hidden" || windowInfo.State == "cloaked":
+		return types.CaptureWMPrint
+	default:
+		return types.CapturePrintWindow
+	}
+}
+
+func (e *WindowsScreenshotEngine) captureWithRetryFallbacks(handle uintptr, windowInfo *types.WindowInfo, options *types.CaptureOptions) (*types.ScreenshotBuffer, error) {
+	fallbackOptions := *options
+	if fallbackOptions.PreferredMethod == types.CaptureAuto {
+		fallbackOptions.PreferredMethod = e.preferredRetryMethod(windowInfo)
+	}
+
+	return e.CaptureWithFallbacks(handle, &fallbackOptions)
+}
+
+func (e *WindowsScreenshotEngine) isLikelyBlankCapture(buffer *types.ScreenshotBuffer) bool {
+	if buffer == nil || len(buffer.Data) == 0 {
+		return true
+	}
+	if buffer.Width <= 2 || buffer.Height <= 2 {
+		return true
+	}
+	if len(buffer.Data) < 4 {
+		return true
+	}
+	if buffer.Format != "BGRA32" && buffer.Format != "RGBA32" {
+		return false
+	}
+
+	pixelCount := len(buffer.Data) / 4
+	step := 1
+	if pixelCount > 4096 {
+		step = pixelCount / 4096
+	}
+
+	firstB := buffer.Data[0]
+	firstG := buffer.Data[1]
+	firstR := buffer.Data[2]
+	firstA := buffer.Data[3]
+
+	sampled := 0
+	blackish := 0
+	transparent := 0
+	different := 0
+
+	for i := 0; i < pixelCount; i += step {
+		idx := i * 4
+		b := buffer.Data[idx]
+		g := buffer.Data[idx+1]
+		r := buffer.Data[idx+2]
+		a := buffer.Data[idx+3]
+
+		sampled++
+		if int(r)+int(g)+int(b) <= 12 {
+			blackish++
+		}
+		if a <= 4 {
+			transparent++
+		}
+		if absInt(int(b)-int(firstB)) > 4 ||
+			absInt(int(g)-int(firstG)) > 4 ||
+			absInt(int(r)-int(firstR)) > 4 ||
+			absInt(int(a)-int(firstA)) > 4 {
+			different++
+		}
+	}
+
+	if sampled == 0 {
+		return true
+	}
+
+	mostlyBlack := float64(blackish)/float64(sampled) >= 0.98
+	mostlyTransparent := float64(transparent)/float64(sampled) >= 0.98
+	littleVariation := float64(different)/float64(sampled) <= 0.02
+
+	return littleVariation && (mostlyBlack || mostlyTransparent)
+}
+
+func absInt(v int) int {
+	if v < 0 {
+		return -v
+	}
+	return v
+}
+
+// ListVisibleWindows enumerates all visible windows with titles
+func (e *WindowsScreenshotEngine) ListVisibleWindows() ([]types.WindowInfo, error) {
+	var windows []types.WindowInfo
+
+	callback := syscall.NewCallback(func(hwnd, lParam uintptr) uintptr {
+		visible, _, _ := isWindowVisible.Call(hwnd)
+		if visible == 0 {
+			return 1
+		}
+
+		titleLen, _, _ := getWindowTextLengthW.Call(hwnd)
+		if titleLen == 0 {
+			return 1
+		}
+
+		if info, err := e.getWindowInfo(hwnd); err == nil {
+			windows = append(windows, *info)
+		}
+		return 1
+	})
+
+	enumWindows.Call(callback, 0)
+	return windows, nil
+}
+
+// ControlWindow changes a window's state, position, or size.
+// Supported actions: restore, maximize, minimize, focus, move, resize.
+func (e *WindowsScreenshotEngine) ControlWindow(handle uintptr, action string, x, y, width, height int) (*types.WindowInfo, error) {
+	switch action {
+	case "restore":
+		showWindow.Call(handle, SW_RESTORE)
+	case "maximize":
+		showWindow.Call(handle, SW_MAXIMIZE)
+	case "minimize":
+		showWindow.Call(handle, SW_MINIMIZE)
+	case "focus":
+		setForegroundWindow.Call(handle)
+		showWindow.Call(handle, SW_RESTORE)
+	case "move":
+		// Keep current size, move to x,y
+		var rect RECT
+		getWindowRect.Call(handle, uintptr(unsafe.Pointer(&rect)))
+		curW := int(rect.Right - rect.Left)
+		curH := int(rect.Bottom - rect.Top)
+		ret, _, _ := moveWindow.Call(handle, uintptr(x), uintptr(y), uintptr(curW), uintptr(curH), 1)
+		if ret == 0 {
+			return nil, fmt.Errorf("MoveWindow failed")
+		}
+	case "resize":
+		// Keep current position, change size
+		var rect RECT
+		getWindowRect.Call(handle, uintptr(unsafe.Pointer(&rect)))
+		ret, _, _ := moveWindow.Call(handle, uintptr(rect.Left), uintptr(rect.Top), uintptr(width), uintptr(height), 1)
+		if ret == 0 {
+			return nil, fmt.Errorf("MoveWindow failed")
+		}
+	case "move_resize":
+		ret, _, _ := moveWindow.Call(handle, uintptr(x), uintptr(y), uintptr(width), uintptr(height), 1)
+		if ret == 0 {
+			return nil, fmt.Errorf("MoveWindow failed")
+		}
+	default:
+		return nil, fmt.Errorf("unsupported action: %s", action)
+	}
+
+	// Small delay for the window manager to process
+	time.Sleep(200 * time.Millisecond)
+
+	// Return updated window info
+	return e.getWindowInfo(handle)
+}
+
+// FindWindowHandle resolves a window handle from method+target (same as capture)
+func (e *WindowsScreenshotEngine) FindWindowHandle(method, target string) (uintptr, error) {
+	switch method {
+	case "title":
+		return e.findWindowByTitle(target)
+	case "class":
+		return e.findWindowByClassName(target)
+	default:
+		return 0, fmt.Errorf("unsupported lookup method: %s", method)
+	}
+}
+
+// FindWindowByPIDPublic is a public wrapper around findWindowByPID
+func (e *WindowsScreenshotEngine) FindWindowByPIDPublic(pid uint32) (uintptr, error) {
+	return e.findWindowByPID(pid)
+}
+
 // Ensure we implement the interface
 var _ types.ScreenshotEngine = (*WindowsScreenshotEngine)(nil)
 
 // Add constants for the advanced features
 const (
 	SW_SHOWNOACTIVATE = 4
+	SW_MAXIMIZE       = 3
+	SW_SHOWNORMAL     = 1
+
+	// SetWindowPos flags
+	SWP_NOZORDER     = 0x0004
+	SWP_NOACTIVATE   = 0x0010
+	SWP_NOMOVE       = 0x0002
+	SWP_NOSIZE       = 0x0001
+	HWND_TOP         = 0
 )
 
 func init() {

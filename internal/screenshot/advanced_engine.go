@@ -2,6 +2,7 @@ package screenshot
 
 import (
 	"fmt"
+	"strings"
 	"syscall"
 	"time"
 	"unsafe"
@@ -27,8 +28,6 @@ var (
 	postMessage                   = user32.NewProc("PostMessageW")
 	enumChildWindows              = user32.NewProc("EnumChildWindows")
 	enumThreadWindows             = user32.NewProc("EnumThreadWindows")
-	getWindowThreadProcessId      = user32.NewProc("GetWindowThreadProcessId")
-	
 	// Process and thread functions
 	createToolhelp32Snapshot      = kernel32.NewProc("CreateToolhelp32Snapshot")
 	process32First               = kernel32.NewProc("Process32FirstW")
@@ -288,9 +287,7 @@ func (e *WindowsScreenshotEngine) CaptureTrayApp(processName string, options *ty
 
 // CaptureWithFallbacks uses multiple capture methods with intelligent fallback
 func (e *WindowsScreenshotEngine) CaptureWithFallbacks(handle uintptr, options *types.CaptureOptions) (*types.ScreenshotBuffer, error) {
-	if options == nil {
-		options = types.DefaultCaptureOptions()
-	}
+	options = e.normalizeCaptureOptions(options)
 	
 	windowInfo, err := e.getWindowInfo(handle)
 	if err != nil {
@@ -304,6 +301,13 @@ func (e *WindowsScreenshotEngine) CaptureWithFallbacks(handle uintptr, options *
 	for i, method := range methods {
 		buffer, err := e.captureWithMethod(handle, windowInfo, method, options)
 		if err == nil {
+			if e.isLikelyBlankCapture(buffer) {
+				lastErr = fmt.Errorf("%s returned a blank/invalid frame", method)
+				if i < len(methods)-1 {
+					time.Sleep(time.Millisecond * 100)
+				}
+				continue
+			}
 			return buffer, nil
 		}
 		lastErr = err
@@ -322,8 +326,10 @@ func (e *WindowsScreenshotEngine) selectCaptureMethods(windowInfo *types.WindowI
 	methods := make([]types.CaptureMethod, 0, 6)
 	
 	// If user specified a preferred method, try it first
-	if options.PreferredMethod != types.CaptureAuto {
+	if options.PreferredMethod != "" && options.PreferredMethod != types.CaptureAuto {
 		methods = append(methods, options.PreferredMethod)
+	} else if windowInfo != nil && strings.HasPrefix(strings.ToLower(windowInfo.ClassName), "qt") {
+		methods = append(methods, types.CapturePrintWindow)
 	}
 	
 	// Add fallback methods based on window state

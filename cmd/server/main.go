@@ -24,6 +24,7 @@ import (
 // Server represents the MCP screenshot server
 type Server struct {
 	engine         types.ScreenshotEngine
+	processor      types.ImageProcessor
 	chromeManager  types.ChromeManager
 	streamManager  *ws.StreamManager
 	logger         *zap.Logger
@@ -51,7 +52,7 @@ type Config struct {
 func DefaultConfig() *Config {
 	return &Config{
 		Port:              8080,
-		Host:              "localhost",
+		Host:              "127.0.0.1",
 		DefaultFormat:     "png",
 		Quality:           95,
 		IncludeCursor:     false,
@@ -95,6 +96,7 @@ func NewServer() (*Server, error) {
 	// Create server instance
 	server := &Server{
 		engine:        engine,
+		processor:     screenshot.NewImageProcessor(),
 		chromeManager: chromeManager,
 		streamManager: streamManager,
 		logger:        logger,
@@ -155,8 +157,11 @@ func (s *Server) setupRouter() {
 	// WebSocket streaming routes (top level for simplicity)
 	s.router.GET("/stream/:windowId", s.handleWebSocketStream)
 
-	// MCP JSON-RPC 2.0 endpoint
+	// MCP JSON-RPC 2.0 endpoint (legacy custom protocol)
 	s.router.POST("/rpc", s.handleMCPRequest)
+
+	// Standard MCP protocol endpoint (Streamable HTTP transport)
+	s.router.POST("/mcp", s.handleMCPProtocol)
 
 	// Documentation
 	s.router.Static("/docs", "./docs")
@@ -306,15 +311,30 @@ func (s *Server) processScreenshotRequest(c *gin.Context, req *types.ScreenshotR
 	}
 
 	// Encode the image data as base64
-	imageData := base64.StdEncoding.EncodeToString(buffer.Data)
+	imageFormat := req.Format
+	if imageFormat == "" {
+		imageFormat = types.FormatPNG
+	}
+	encoded, err := s.processor.Encode(buffer, imageFormat, req.Quality)
+	if err != nil {
+		s.logger.Error("Screenshot encoding failed",
+			zap.String("method", req.Method),
+			zap.String("target", req.Target),
+			zap.Error(err),
+		)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	imageData := base64.StdEncoding.EncodeToString(encoded)
 
 	response := types.ScreenshotResponse{
 		Success:   true,
 		Data:      imageData,
-		Format:    buffer.Format,
+		Format:    string(imageFormat),
 		Width:     buffer.Width,
 		Height:    buffer.Height,
-		Size:      int64(len(buffer.Data)),
+		Size:      int64(len(encoded)),
 		Timestamp: buffer.Timestamp,
 		Metadata: types.Metadata{
 			CaptureMethod:  req.Method,
@@ -446,15 +466,21 @@ func (s *Server) takeChromeTabScreenshot(c *gin.Context) {
 	}
 
 	// Encode as base64
-	imageData := base64.StdEncoding.EncodeToString(buffer.Data)
+	encoded, err := s.processor.Encode(buffer, types.FormatPNG, s.config.Quality)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	imageData := base64.StdEncoding.EncodeToString(encoded)
 
 	response := types.ScreenshotResponse{
 		Success:   true,
 		Data:      imageData,
-		Format:    buffer.Format,
+		Format:    string(types.FormatPNG),
 		Width:     buffer.Width,
 		Height:    buffer.Height,
-		Size:      int64(len(buffer.Data)),
+		Size:      int64(len(encoded)),
 		Timestamp: buffer.Timestamp,
 		Metadata: types.Metadata{
 			CaptureMethod: "chrome_tab",
@@ -502,14 +528,12 @@ func (s *Server) handleMCPRequest(c *gin.Context) {
 
 // handleMCPScreenshot handles MCP screenshot requests
 func (s *Server) handleMCPScreenshot(c *gin.Context, req *types.MCPRequest) {
-	// Parse parameters
 	params, ok := req.Params.(map[string]interface{})
 	if !ok {
 		s.sendMCPError(c, req.ID, -32602, "Invalid params", nil)
 		return
 	}
 
-	// Build screenshot request
 	screenshotReq := types.ScreenshotRequest{
 		Method:        getString(params, "method", "title"),
 		Target:        getString(params, "target", ""),
@@ -523,7 +547,6 @@ func (s *Server) handleMCPScreenshot(c *gin.Context, req *types.MCPRequest) {
 		return
 	}
 
-	// Process the request (reuse existing logic)
 	options := &types.CaptureOptions{
 		IncludeCursor:    screenshotReq.IncludeCursor,
 		IncludeFrame:     getBool(params, "include_frame", true),
@@ -564,15 +587,24 @@ func (s *Server) handleMCPScreenshot(c *gin.Context, req *types.MCPRequest) {
 		return
 	}
 
-	// Encode and send response
-	imageData := base64.StdEncoding.EncodeToString(buffer.Data)
+	format := screenshotReq.Format
+	if format == "" {
+		format = types.FormatPNG
+	}
+	encoded, err := s.processor.Encode(buffer, format, screenshotReq.Quality)
+	if err != nil {
+		s.sendMCPError(c, req.ID, -32603, "Encoding failed", err.Error())
+		return
+	}
+
+	imageData := base64.StdEncoding.EncodeToString(encoded)
 	result := types.ScreenshotResponse{
 		Success:   true,
 		Data:      imageData,
-		Format:    buffer.Format,
+		Format:    string(format),
 		Width:     buffer.Width,
 		Height:    buffer.Height,
-		Size:      int64(len(buffer.Data)),
+		Size:      int64(len(encoded)),
 		Timestamp: buffer.Timestamp,
 	}
 
@@ -642,7 +674,6 @@ func (s *Server) handleMCPChromeTabCapture(c *gin.Context, req *types.MCPRequest
 		return
 	}
 
-	// Find the tab (reuse existing logic)
 	instances, err := s.chromeManager.DiscoverInstances()
 	if err != nil {
 		s.sendMCPError(c, req.ID, -32603, "Internal error", err.Error())
@@ -655,7 +686,6 @@ func (s *Server) handleMCPChromeTabCapture(c *gin.Context, req *types.MCPRequest
 		if err != nil {
 			continue
 		}
-		
 		for _, tab := range tabs {
 			if tab.ID == tabID {
 				targetTab = &tab
@@ -672,7 +702,6 @@ func (s *Server) handleMCPChromeTabCapture(c *gin.Context, req *types.MCPRequest
 		return
 	}
 
-	// Capture screenshot
 	options := types.DefaultCaptureOptions()
 	buffer, err := s.chromeManager.CaptureTab(targetTab, options)
 	if err != nil {
@@ -680,15 +709,20 @@ func (s *Server) handleMCPChromeTabCapture(c *gin.Context, req *types.MCPRequest
 		return
 	}
 
-	// Encode and send response
-	imageData := base64.StdEncoding.EncodeToString(buffer.Data)
+	encoded, err := s.processor.Encode(buffer, types.FormatPNG, s.config.Quality)
+	if err != nil {
+		s.sendMCPError(c, req.ID, -32603, "Encoding failed", err.Error())
+		return
+	}
+
+	imageData := base64.StdEncoding.EncodeToString(encoded)
 	result := types.ScreenshotResponse{
 		Success:   true,
 		Data:      imageData,
-		Format:    buffer.Format,
+		Format:    string(types.FormatPNG),
 		Width:     buffer.Width,
 		Height:    buffer.Height,
-		Size:      int64(len(buffer.Data)),
+		Size:      int64(len(encoded)),
 		Timestamp: buffer.Timestamp,
 	}
 
@@ -938,6 +972,447 @@ func (s *Server) getStreamStatus(c *gin.Context) {
 		"total_frames":    stats.TotalFrames,
 		"uptime":          stats.Uptime.String(),
 		"max_sessions":    s.config.StreamMaxSessions,
+	})
+}
+
+// ============================================================
+// Standard MCP Protocol (Streamable HTTP transport)
+// ============================================================
+
+// handleMCPProtocol handles standard MCP protocol requests
+func (s *Server) handleMCPProtocol(c *gin.Context) {
+	var req types.MCPRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		s.sendMCPError(c, nil, -32700, "Parse error", nil)
+		return
+	}
+
+	s.logger.Debug("MCP protocol request",
+		zap.String("method", req.Method),
+		zap.Any("id", req.ID),
+	)
+
+	// Notifications (no id) get 202 Accepted with no body
+	if req.ID == nil {
+		c.Status(http.StatusAccepted)
+		return
+	}
+
+	switch req.Method {
+	case "initialize":
+		s.handleMCPProtocolInitialize(c, &req)
+	case "ping":
+		s.sendMCPResult(c, req.ID, map[string]interface{}{})
+	case "tools/list":
+		s.handleMCPProtocolToolsList(c, &req)
+	case "tools/call":
+		s.handleMCPProtocolToolsCall(c, &req)
+	default:
+		s.sendMCPError(c, req.ID, -32601, "Method not found", nil)
+	}
+}
+
+func (s *Server) handleMCPProtocolInitialize(c *gin.Context, req *types.MCPRequest) {
+	result := map[string]interface{}{
+		"protocolVersion": "2024-11-05",
+		"capabilities": map[string]interface{}{
+			"tools": map[string]interface{}{},
+		},
+		"serverInfo": map[string]interface{}{
+			"name":    "windows-screenshot",
+			"version": "1.0.0",
+		},
+	}
+	s.sendMCPResult(c, req.ID, result)
+}
+
+func (s *Server) handleMCPProtocolToolsList(c *gin.Context, req *types.MCPRequest) {
+	tools := []map[string]interface{}{
+		{
+			"name":        "take_screenshot",
+			"description": "Capture a screenshot of a window identified by title, process ID, window handle, or class name. Returns the image as base64-encoded PNG/JPEG.",
+			"inputSchema": map[string]interface{}{
+				"type": "object",
+				"properties": map[string]interface{}{
+					"method": map[string]interface{}{
+						"type":        "string",
+						"enum":        []string{"title", "pid", "handle", "class"},
+						"description": "How to identify the target window",
+					},
+					"target": map[string]interface{}{
+						"type":        "string",
+						"description": "Window identifier (exact title, PID number, handle number, or class name)",
+					},
+					"format": map[string]interface{}{
+						"type":        "string",
+						"enum":        []string{"png", "jpeg"},
+						"default":     "png",
+						"description": "Output image format",
+					},
+				},
+				"required": []string{"method", "target"},
+			},
+		},
+		{
+			"name":        "capture_desktop",
+			"description": "Capture a full screenshot of the entire desktop / primary monitor.",
+			"inputSchema": map[string]interface{}{
+				"type":       "object",
+				"properties": map[string]interface{}{},
+			},
+		},
+		{
+			"name":        "list_windows",
+			"description": "List all visible windows with their titles, class names, and process IDs.",
+			"inputSchema": map[string]interface{}{
+				"type":       "object",
+				"properties": map[string]interface{}{},
+			},
+		},
+		{
+			"name":        "control_window",
+			"description": "Control a window's state, position, or size. Actions: restore, maximize, minimize, focus, move, resize, move_resize.",
+			"inputSchema": map[string]interface{}{
+				"type": "object",
+				"properties": map[string]interface{}{
+					"method": map[string]interface{}{
+						"type":        "string",
+						"enum":        []string{"title", "pid", "handle", "class"},
+						"description": "How to identify the target window",
+					},
+					"target": map[string]interface{}{
+						"type":        "string",
+						"description": "Window identifier (exact title, PID number, handle number, or class name)",
+					},
+					"action": map[string]interface{}{
+						"type":        "string",
+						"enum":        []string{"restore", "maximize", "minimize", "focus", "move", "resize", "move_resize"},
+						"description": "The action to perform on the window",
+					},
+					"x": map[string]interface{}{
+						"type":        "integer",
+						"description": "X position in pixels (for move/move_resize)",
+					},
+					"y": map[string]interface{}{
+						"type":        "integer",
+						"description": "Y position in pixels (for move/move_resize)",
+					},
+					"width": map[string]interface{}{
+						"type":        "integer",
+						"description": "Width in pixels (for resize/move_resize)",
+					},
+					"height": map[string]interface{}{
+						"type":        "integer",
+						"description": "Height in pixels (for resize/move_resize)",
+					},
+				},
+				"required": []string{"method", "target", "action"},
+			},
+		},
+	}
+
+	result := map[string]interface{}{
+		"tools": tools,
+	}
+	s.sendMCPResult(c, req.ID, result)
+}
+
+func (s *Server) handleMCPProtocolToolsCall(c *gin.Context, req *types.MCPRequest) {
+	params, ok := req.Params.(map[string]interface{})
+	if !ok {
+		s.sendMCPError(c, req.ID, -32602, "Invalid params", nil)
+		return
+	}
+
+	toolName := getString(params, "name", "")
+	args, _ := params["arguments"].(map[string]interface{})
+	if args == nil {
+		args = map[string]interface{}{}
+	}
+
+	switch toolName {
+	case "take_screenshot":
+		s.mcpToolTakeScreenshot(c, req, args)
+	case "capture_desktop":
+		s.mcpToolCaptureDesktop(c, req)
+	case "list_windows":
+		s.mcpToolListWindows(c, req)
+	case "control_window":
+		s.mcpToolControlWindow(c, req, args)
+	default:
+		s.sendMCPError(c, req.ID, -32602, fmt.Sprintf("Unknown tool: %s", toolName), nil)
+	}
+}
+
+func (s *Server) mcpToolTakeScreenshot(c *gin.Context, req *types.MCPRequest, args map[string]interface{}) {
+	method := getString(args, "method", "title")
+	target := getString(args, "target", "")
+	format := getString(args, "format", "png")
+
+	if target == "" {
+		s.sendMCPResult(c, req.ID, map[string]interface{}{
+			"isError": true,
+			"content": []map[string]interface{}{
+				{"type": "text", "text": "Missing required argument: target"},
+			},
+		})
+		return
+	}
+
+	options := &types.CaptureOptions{
+		IncludeCursor:    false,
+		IncludeFrame:     true,
+		ScaleFactor:      1.0,
+		AllowMinimized:   true,
+		RestoreWindow:    false,
+		WaitForVisible:   2 * time.Second,
+		RetryCount:       3,
+		CustomProperties: make(map[string]string),
+	}
+
+	var buffer *types.ScreenshotBuffer
+	var err error
+
+	switch method {
+	case "title":
+		buffer, err = s.engine.CaptureByTitle(target, options)
+	case "pid":
+		if pid, parseErr := strconv.ParseUint(target, 10, 32); parseErr == nil {
+			buffer, err = s.engine.CaptureByPID(uint32(pid), options)
+		} else {
+			err = fmt.Errorf("invalid PID: %s", target)
+		}
+	case "handle":
+		if handle, parseErr := strconv.ParseUint(target, 10, 64); parseErr == nil {
+			buffer, err = s.engine.CaptureByHandle(uintptr(handle), options)
+		} else {
+			err = fmt.Errorf("invalid handle: %s", target)
+		}
+	case "class":
+		buffer, err = s.engine.CaptureByClassName(target, options)
+	default:
+		err = fmt.Errorf("unsupported method: %s", method)
+	}
+
+	if err != nil {
+		s.sendMCPResult(c, req.ID, map[string]interface{}{
+			"isError": true,
+			"content": []map[string]interface{}{
+				{"type": "text", "text": fmt.Sprintf("Screenshot failed: %s", err.Error())},
+			},
+		})
+		return
+	}
+
+	// Validate captured dimensions — reject tiny/unusable captures
+	const minUsableWidth = 200
+	const minUsableHeight = 100
+	if buffer.Width < minUsableWidth || buffer.Height < minUsableHeight {
+		state := buffer.WindowInfo.State
+		if state == "" {
+			state = "unknown"
+		}
+		msg := fmt.Sprintf(
+			"Window is too small to capture usefully (%dx%d, state: %s). "+
+				"The window may be minimized or resized to its title bar. "+
+				"Please restore or resize the window and try again.",
+			buffer.Width, buffer.Height, state)
+		s.sendMCPResult(c, req.ID, map[string]interface{}{
+			"isError": true,
+			"content": []map[string]interface{}{
+				{"type": "text", "text": msg},
+			},
+		})
+		return
+	}
+
+	imageFormat := types.FormatPNG
+	mimeType := "image/png"
+	if format == "jpeg" {
+		imageFormat = types.FormatJPEG
+		mimeType = "image/jpeg"
+	}
+
+	encoded, err := s.processor.Encode(buffer, imageFormat, s.config.Quality)
+	if err != nil {
+		s.sendMCPResult(c, req.ID, map[string]interface{}{
+			"isError": true,
+			"content": []map[string]interface{}{
+				{"type": "text", "text": fmt.Sprintf("Image encoding failed: %s", err.Error())},
+			},
+		})
+		return
+	}
+
+	imageData := base64.StdEncoding.EncodeToString(encoded)
+
+	s.sendMCPResult(c, req.ID, map[string]interface{}{
+		"content": []map[string]interface{}{
+			{
+				"type":     "image",
+				"data":     imageData,
+				"mimeType": mimeType,
+			},
+			{
+				"type": "text",
+				"text": fmt.Sprintf("Screenshot captured: %dx%d %s (%d bytes)",
+					buffer.Width, buffer.Height, format, len(encoded)),
+			},
+		},
+	})
+}
+
+func (s *Server) mcpToolCaptureDesktop(c *gin.Context, req *types.MCPRequest) {
+	options := &types.CaptureOptions{
+		IncludeCursor:    true,
+		IncludeFrame:     true,
+		ScaleFactor:      1.0,
+		CustomProperties: make(map[string]string),
+	}
+
+	buffer, err := s.engine.CaptureFullScreen(0, options)
+	if err != nil {
+		s.sendMCPResult(c, req.ID, map[string]interface{}{
+			"isError": true,
+			"content": []map[string]interface{}{
+				{"type": "text", "text": fmt.Sprintf("Desktop capture failed: %s", err.Error())},
+			},
+		})
+		return
+	}
+
+	encoded, err := s.processor.Encode(buffer, types.FormatPNG, s.config.Quality)
+	if err != nil {
+		s.sendMCPResult(c, req.ID, map[string]interface{}{
+			"isError": true,
+			"content": []map[string]interface{}{
+				{"type": "text", "text": fmt.Sprintf("Image encoding failed: %s", err.Error())},
+			},
+		})
+		return
+	}
+
+	imageData := base64.StdEncoding.EncodeToString(encoded)
+
+	s.sendMCPResult(c, req.ID, map[string]interface{}{
+		"content": []map[string]interface{}{
+			{
+				"type":     "image",
+				"data":     imageData,
+				"mimeType": "image/png",
+			},
+			{
+				"type": "text",
+				"text": fmt.Sprintf("Desktop captured: %dx%d (%d bytes)",
+					buffer.Width, buffer.Height, len(encoded)),
+			},
+		},
+	})
+}
+
+func (s *Server) mcpToolListWindows(c *gin.Context, req *types.MCPRequest) {
+	windows, err := s.engine.ListVisibleWindows()
+	if err != nil {
+		s.sendMCPResult(c, req.ID, map[string]interface{}{
+			"isError": true,
+			"content": []map[string]interface{}{
+				{"type": "text", "text": fmt.Sprintf("Failed to list windows: %s", err.Error())},
+			},
+		})
+		return
+	}
+
+	text := fmt.Sprintf("Found %d visible windows:\n\n", len(windows))
+	for _, w := range windows {
+		text += fmt.Sprintf("- \"%s\" (class: %s, PID: %d, handle: %d, size: %dx%d, state: %s)\n",
+			w.Title, w.ClassName, w.ProcessID, w.Handle,
+			w.Rect.Width, w.Rect.Height, w.State)
+	}
+
+	s.sendMCPResult(c, req.ID, map[string]interface{}{
+		"content": []map[string]interface{}{
+			{"type": "text", "text": text},
+		},
+	})
+}
+
+func (s *Server) mcpToolControlWindow(c *gin.Context, req *types.MCPRequest, args map[string]interface{}) {
+	method := getString(args, "method", "title")
+	target := getString(args, "target", "")
+	action := getString(args, "action", "")
+
+	if target == "" || action == "" {
+		s.sendMCPResult(c, req.ID, map[string]interface{}{
+			"isError": true,
+			"content": []map[string]interface{}{
+				{"type": "text", "text": "Missing required arguments: target and action"},
+			},
+		})
+		return
+	}
+
+	// Resolve window handle
+	var handle uintptr
+	var err error
+
+	switch method {
+	case "title":
+		handle, err = s.engine.FindWindowHandle("title", target)
+	case "pid":
+		if pid, parseErr := strconv.ParseUint(target, 10, 32); parseErr == nil {
+			handle, err = s.engine.FindWindowByPIDPublic(uint32(pid))
+		} else {
+			err = fmt.Errorf("invalid PID: %s", target)
+		}
+	case "handle":
+		if h, parseErr := strconv.ParseUint(target, 10, 64); parseErr == nil {
+			handle = uintptr(h)
+		} else {
+			err = fmt.Errorf("invalid handle: %s", target)
+		}
+	case "class":
+		handle, err = s.engine.FindWindowHandle("class", target)
+	default:
+		err = fmt.Errorf("unsupported method: %s", method)
+	}
+
+	if err != nil {
+		s.sendMCPResult(c, req.ID, map[string]interface{}{
+			"isError": true,
+			"content": []map[string]interface{}{
+				{"type": "text", "text": fmt.Sprintf("Window not found: %s", err.Error())},
+			},
+		})
+		return
+	}
+
+	// Parse optional position/size args
+	x := getInt(args, "x", 0)
+	y := getInt(args, "y", 0)
+	width := getInt(args, "width", 800)
+	height := getInt(args, "height", 600)
+
+	info, err := s.engine.ControlWindow(handle, action, x, y, width, height)
+	if err != nil {
+		s.sendMCPResult(c, req.ID, map[string]interface{}{
+			"isError": true,
+			"content": []map[string]interface{}{
+				{"type": "text", "text": fmt.Sprintf("Control failed: %s", err.Error())},
+			},
+		})
+		return
+	}
+
+	s.sendMCPResult(c, req.ID, map[string]interface{}{
+		"content": []map[string]interface{}{
+			{
+				"type": "text",
+				"text": fmt.Sprintf("Window '%s' %s done. New state: %s, size: %dx%d, position: (%d,%d)",
+					info.Title, action, info.State,
+					info.Rect.Width, info.Rect.Height,
+					info.Rect.X, info.Rect.Y),
+			},
+		},
 	})
 }
 
