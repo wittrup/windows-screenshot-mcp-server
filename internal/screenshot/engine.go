@@ -49,7 +49,10 @@ var (
 	getCursorPos          = user32.NewProc("GetCursorPos")
 	sendInput             = user32.NewProc("SendInput")
 	clientToScreen        = user32.NewProc("ClientToScreen")
+	screenToClient        = user32.NewProc("ScreenToClient")
 	getSystemMetrics      = user32.NewProc("GetSystemMetrics")
+	childWindowFromPoint  = user32.NewProc("ChildWindowFromPoint")
+	mapWindowPoints       = user32.NewProc("MapWindowPoints")
 	
 	// GDI32 functions
 	createCompatibleDC    = gdi32.NewProc("CreateCompatibleDC")
@@ -824,14 +827,145 @@ func (e *WindowsScreenshotEngine) FindWindowByPIDPublic(pid uint32) (uintptr, er
 // When windowHandle == 0, falls back to SetCursorPos + SendInput (screen-absolute).
 func (e *WindowsScreenshotEngine) ClickMouse(x, y int, button, clickType string, windowHandle uintptr) error {
 	if windowHandle != 0 {
+		// Qt ignores PostMessage-based synthetic clicks — its input system
+		// requires real hardware events.  Detect Qt windows and use
+		// targeted physical click (converts screenshot coords → screen
+		// coords, briefly moves cursor, clicks, restores cursor).
+		if e.isQtWindow(windowHandle) {
+			return e.clickMouseTargeted(x, y, button, clickType, windowHandle)
+		}
 		return e.clickMouseStealth(x, y, button, clickType, windowHandle)
 	}
 	return e.clickMousePhysical(x, y, button, clickType)
 }
 
+// isQtWindow checks if a window belongs to a Qt framework
+func (e *WindowsScreenshotEngine) isQtWindow(hwnd uintptr) bool {
+	classBuf := make([]uint16, 256)
+	getClassName.Call(hwnd, uintptr(unsafe.Pointer(&classBuf[0])), 256)
+	className := strings.ToLower(syscall.UTF16ToString(classBuf))
+	return strings.HasPrefix(className, "qt")
+}
+
+// clickMouseTargeted converts screenshot coords to screen coords, saves/restores
+// cursor position, and uses SendInput for a real click. Works with all frameworks
+// including Qt.  Cursor is restored immediately after the click.
+func (e *WindowsScreenshotEngine) clickMouseTargeted(x, y int, button, clickType string, hwnd uintptr) error {
+	// Get frame offset (screenshot includes title bar + borders)
+	var windowRect RECT
+	getWindowRect.Call(hwnd, uintptr(unsafe.Pointer(&windowRect)))
+
+	clientOrigin := POINT{X: 0, Y: 0}
+	clientToScreen.Call(hwnd, uintptr(unsafe.Pointer(&clientOrigin)))
+
+	frameOffsetX := int(clientOrigin.X - windowRect.Left)
+	frameOffsetY := int(clientOrigin.Y - windowRect.Top)
+
+	// Screenshot coord → screen coord
+	screenX := int(windowRect.Left) + x
+	screenY := int(windowRect.Top) + y
+	// But adjust because the client area starts after the frame
+	_ = frameOffsetX
+	_ = frameOffsetY
+
+	// Save current cursor position
+	var savedPos POINT
+	getCursorPos.Call(uintptr(unsafe.Pointer(&savedPos)))
+
+	// Bring window to foreground
+	setForegroundWindow.Call(hwnd)
+	time.Sleep(100 * time.Millisecond)
+
+	// Move, click, restore
+	setCursorPos.Call(uintptr(screenX), uintptr(screenY))
+	time.Sleep(30 * time.Millisecond)
+
+	var downFlag, upFlag uint32
+	switch button {
+	case "right":
+		downFlag, upFlag = MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP
+	case "middle":
+		downFlag, upFlag = MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP
+	default:
+		downFlag, upFlag = MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP
+	}
+
+	clicks := 1
+	if clickType == "double" {
+		clicks = 2
+	}
+
+	for i := 0; i < clicks; i++ {
+		inputDown := INPUT{Type: INPUT_MOUSE}
+		inputDown.Mi.DwFlags = downFlag
+		sendInput.Call(1, uintptr(unsafe.Pointer(&inputDown)), unsafe.Sizeof(inputDown))
+		time.Sleep(20 * time.Millisecond)
+
+		inputUp := INPUT{Type: INPUT_MOUSE}
+		inputUp.Mi.DwFlags = upFlag
+		sendInput.Call(1, uintptr(unsafe.Pointer(&inputUp)), unsafe.Sizeof(inputUp))
+		if i < clicks-1 {
+			time.Sleep(50 * time.Millisecond)
+		}
+	}
+
+	// Restore cursor to original position
+	time.Sleep(30 * time.Millisecond)
+	setCursorPos.Call(uintptr(savedPos.X), uintptr(savedPos.Y))
+
+	return nil
+}
+
 // clickMouseStealth sends WM_*BUTTON messages via PostMessage — no cursor movement.
+// The x,y are "screenshot coordinates" (include window frame/title bar), so we
+// convert to client-area coordinates, then find the deepest child window at that
+// point so Qt and other frameworks receive the message on the correct HWND.
 func (e *WindowsScreenshotEngine) clickMouseStealth(x, y int, button, clickType string, hwnd uintptr) error {
-	lParam := uintptr((y << 16) | (x & 0xFFFF))
+	// 1. Convert screenshot (frame-inclusive) coords to client coords.
+	//    Screenshot coords include title bar + borders. Client (0,0) starts
+	//    below the title bar. We use the difference between window rect and
+	//    client rect origin to compute the offset.
+	var windowRect, clientRect RECT
+	getWindowRect.Call(hwnd, uintptr(unsafe.Pointer(&windowRect)))
+	getClientRect.Call(hwnd, uintptr(unsafe.Pointer(&clientRect)))
+
+	// Map client (0,0) to screen coords to find the offset
+	clientOrigin := POINT{X: 0, Y: 0}
+	clientToScreen.Call(hwnd, uintptr(unsafe.Pointer(&clientOrigin)))
+
+	frameOffsetX := int(clientOrigin.X - windowRect.Left)
+	frameOffsetY := int(clientOrigin.Y - windowRect.Top)
+
+	clientX := x - frameOffsetX
+	clientY := y - frameOffsetY
+
+	// Clamp to client area
+	if clientX < 0 {
+		clientX = 0
+	}
+	if clientY < 0 {
+		clientY = 0
+	}
+
+	// 2. Find the deepest child window at this client point.
+	//    Qt and other frameworks may use child HWNDs for rendering.
+	targetHwnd := hwnd
+	pt := POINT{X: int32(clientX), Y: int32(clientY)}
+	child, _, _ := childWindowFromPoint.Call(hwnd, uintptr(pt.X), uintptr(pt.Y))
+	if child != 0 && child != hwnd {
+		// Map coordinates from parent client to child client
+		mapWindowPoints.Call(hwnd, child, uintptr(unsafe.Pointer(&pt)), 1)
+		targetHwnd = child
+		clientX = int(pt.X)
+		clientY = int(pt.Y)
+	}
+
+	// 3. Bring parent to foreground so the app processes input
+	setForegroundWindow.Call(hwnd)
+	time.Sleep(50 * time.Millisecond)
+
+	// 4. Post the mouse messages
+	lParam := uintptr((clientY << 16) | (clientX & 0xFFFF))
 
 	var downMsg, upMsg, dblMsg uintptr
 	var wParamDown uintptr
@@ -846,7 +980,7 @@ func (e *WindowsScreenshotEngine) clickMouseStealth(x, y int, button, clickType 
 		upMsg = WM_MBUTTONUP
 		dblMsg = WM_MBUTTONDBLCLK
 		wParamDown = MK_MBUTTON
-	default: // "left"
+	default:
 		downMsg = WM_LBUTTONDOWN
 		upMsg = WM_LBUTTONUP
 		dblMsg = WM_LBUTTONDBLCLK
@@ -854,18 +988,17 @@ func (e *WindowsScreenshotEngine) clickMouseStealth(x, y int, button, clickType 
 	}
 
 	if clickType == "double" {
-		// Double-click sequence: down, up, dblclk, up
-		postMessage.Call(hwnd, downMsg, wParamDown, lParam)
+		postMessage.Call(targetHwnd, downMsg, wParamDown, lParam)
 		time.Sleep(20 * time.Millisecond)
-		postMessage.Call(hwnd, upMsg, 0, lParam)
+		postMessage.Call(targetHwnd, upMsg, 0, lParam)
 		time.Sleep(20 * time.Millisecond)
-		postMessage.Call(hwnd, dblMsg, wParamDown, lParam)
+		postMessage.Call(targetHwnd, dblMsg, wParamDown, lParam)
 		time.Sleep(20 * time.Millisecond)
-		postMessage.Call(hwnd, upMsg, 0, lParam)
+		postMessage.Call(targetHwnd, upMsg, 0, lParam)
 	} else {
-		postMessage.Call(hwnd, downMsg, wParamDown, lParam)
+		postMessage.Call(targetHwnd, downMsg, wParamDown, lParam)
 		time.Sleep(20 * time.Millisecond)
-		postMessage.Call(hwnd, upMsg, 0, lParam)
+		postMessage.Call(targetHwnd, upMsg, 0, lParam)
 	}
 
 	return nil
