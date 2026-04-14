@@ -772,11 +772,12 @@ func (e *WindowsScreenshotEngine) ControlWindow(handle uintptr, action string, x
 		showWindow.Call(handle, SW_RESTORE)
 	case "move":
 		// Keep current size, move to x,y
+		// Use int32 cast to preserve sign for negative multi-monitor coordinates
 		var rect RECT
 		getWindowRect.Call(handle, uintptr(unsafe.Pointer(&rect)))
-		curW := int(rect.Right - rect.Left)
-		curH := int(rect.Bottom - rect.Top)
-		ret, _, _ := moveWindow.Call(handle, uintptr(x), uintptr(y), uintptr(curW), uintptr(curH), 1)
+		curW := int32(rect.Right - rect.Left)
+		curH := int32(rect.Bottom - rect.Top)
+		ret, _, _ := moveWindow.Call(handle, uintptr(int32(x)), uintptr(int32(y)), uintptr(curW), uintptr(curH), 1)
 		if ret == 0 {
 			return nil, fmt.Errorf("MoveWindow failed")
 		}
@@ -784,12 +785,12 @@ func (e *WindowsScreenshotEngine) ControlWindow(handle uintptr, action string, x
 		// Keep current position, change size
 		var rect RECT
 		getWindowRect.Call(handle, uintptr(unsafe.Pointer(&rect)))
-		ret, _, _ := moveWindow.Call(handle, uintptr(rect.Left), uintptr(rect.Top), uintptr(width), uintptr(height), 1)
+		ret, _, _ := moveWindow.Call(handle, uintptr(rect.Left), uintptr(rect.Top), uintptr(int32(width)), uintptr(int32(height)), 1)
 		if ret == 0 {
 			return nil, fmt.Errorf("MoveWindow failed")
 		}
 	case "move_resize":
-		ret, _, _ := moveWindow.Call(handle, uintptr(x), uintptr(y), uintptr(width), uintptr(height), 1)
+		ret, _, _ := moveWindow.Call(handle, uintptr(int32(x)), uintptr(int32(y)), uintptr(int32(width)), uintptr(int32(height)), 1)
 		if ret == 0 {
 			return nil, fmt.Errorf("MoveWindow failed")
 		}

@@ -284,6 +284,7 @@ const (
 	CaptureWMPrint     CaptureMethod = "wmprint"      // WM_PRINT message
 	CaptureStealthRestore CaptureMethod = "stealth"   // Temporarily restore minimized windows
 	CaptureProcessMemory CaptureMethod = "memory"     // Direct process memory access
+	CaptureScreenDC      CaptureMethod = "screendc"   // BitBlt from virtual screen DC (multi-monitor)
 )
 
 // CaptureOptions defines options for screenshot capture

@@ -335,13 +335,14 @@ func (e *WindowsScreenshotEngine) selectCaptureMethods(windowInfo *types.WindowI
 	// Add fallback methods based on window state
 	switch windowInfo.State {
 	case "visible":
-		methods = append(methods, types.CaptureBitBlt, types.CapturePrintWindow, types.CaptureDWMThumbnail)
+		// ScreenDC first — works across all monitors
+		methods = append(methods, types.CaptureScreenDC, types.CaptureBitBlt, types.CapturePrintWindow, types.CaptureDWMThumbnail)
 	case "minimized":
 		methods = append(methods, types.CaptureDWMThumbnail, types.CapturePrintWindow, types.CaptureWMPrint, types.CaptureStealthRestore)
 	case "hidden", "cloaked":
 		methods = append(methods, types.CaptureDWMThumbnail, types.CaptureWMPrint, types.CapturePrintWindow)
 	default:
-		methods = append(methods, types.CaptureDWMThumbnail, types.CapturePrintWindow, types.CaptureWMPrint, types.CaptureBitBlt)
+		methods = append(methods, types.CaptureScreenDC, types.CaptureDWMThumbnail, types.CapturePrintWindow, types.CaptureWMPrint, types.CaptureBitBlt)
 	}
 	
 	// Add user-specified fallback methods
@@ -356,6 +357,8 @@ func (e *WindowsScreenshotEngine) selectCaptureMethods(windowInfo *types.WindowI
 // captureWithMethod captures using a specific method
 func (e *WindowsScreenshotEngine) captureWithMethod(handle uintptr, windowInfo *types.WindowInfo, method types.CaptureMethod, options *types.CaptureOptions) (*types.ScreenshotBuffer, error) {
 	switch method {
+	case types.CaptureScreenDC:
+		return e.captureFromScreenDC(handle, windowInfo, options)
 	case types.CaptureBitBlt:
 		return e.captureVisibleWindow(handle, windowInfo, options)
 	case types.CapturePrintWindow:
@@ -369,6 +372,77 @@ func (e *WindowsScreenshotEngine) captureWithMethod(handle uintptr, windowInfo *
 	default:
 		return nil, fmt.Errorf("unsupported capture method: %s", method)
 	}
+}
+
+// captureFromScreenDC captures by BitBlt'ing from the virtual screen DC using
+// the window's screen coordinates. Works reliably across all monitors.
+func (e *WindowsScreenshotEngine) captureFromScreenDC(handle uintptr, windowInfo *types.WindowInfo, options *types.CaptureOptions) (*types.ScreenshotBuffer, error) {
+	var rect RECT
+	getWindowRect.Call(handle, uintptr(unsafe.Pointer(&rect)))
+
+	width := int(rect.Right - rect.Left)
+	height := int(rect.Bottom - rect.Top)
+	if width <= 0 || height <= 0 {
+		return nil, fmt.Errorf("invalid window dimensions: %dx%d", width, height)
+	}
+
+	// Get the virtual screen DC — spans ALL monitors
+	screenDC, _, _ := getDC.Call(0)
+	if screenDC == 0 {
+		return nil, fmt.Errorf("failed to get screen DC")
+	}
+	defer releaseDC.Call(0, screenDC)
+
+	memDC, _, _ := createCompatibleDC.Call(screenDC)
+	if memDC == 0 {
+		return nil, fmt.Errorf("failed to create compatible DC")
+	}
+	defer deleteDC.Call(memDC)
+
+	var bmi BITMAPINFO
+	bmi.Header.Size = uint32(unsafe.Sizeof(bmi.Header))
+	bmi.Header.Width = int32(width)
+	bmi.Header.Height = -int32(height)
+	bmi.Header.Planes = 1
+	bmi.Header.BitCount = 32
+	bmi.Header.Compression = BI_RGB
+
+	var pBits uintptr
+	bitmap, _, _ := createDIBSection.Call(memDC, uintptr(unsafe.Pointer(&bmi)), DIB_RGB_COLORS, uintptr(unsafe.Pointer(&pBits)), 0, 0)
+	if bitmap == 0 {
+		return nil, fmt.Errorf("failed to create DIB section")
+	}
+	defer deleteObject.Call(bitmap)
+
+	oldBitmap, _, _ := selectObject.Call(memDC, bitmap)
+	defer selectObject.Call(memDC, oldBitmap)
+
+	// BitBlt from screen DC at the window's absolute screen position
+	ret, _, _ := bitBlt.Call(
+		memDC, 0, 0, uintptr(width), uintptr(height),
+		screenDC, uintptr(int32(rect.Left)), uintptr(int32(rect.Top)), SRCCOPY,
+	)
+	if ret == 0 {
+		return nil, fmt.Errorf("BitBlt from screen DC failed")
+	}
+
+	pixelCount := width * height * 4
+	pixelData := make([]byte, pixelCount)
+	if pBits != 0 {
+		copy(pixelData, (*[1 << 30]byte)(unsafe.Pointer(pBits))[:pixelCount:pixelCount])
+	}
+
+	return &types.ScreenshotBuffer{
+		Data:       pixelData,
+		Width:      width,
+		Height:     height,
+		Stride:     width * 4,
+		Format:     "BGRA32",
+		DPI:        96,
+		Timestamp:  time.Now(),
+		SourceRect: types.Rectangle{X: int(rect.Left), Y: int(rect.Top), Width: width, Height: height},
+		WindowInfo: *windowInfo,
+	}, nil
 }
 
 // captureDWMThumbnail uses the DWM Thumbnail API to capture any window
