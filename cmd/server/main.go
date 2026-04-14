@@ -1070,6 +1070,40 @@ func (s *Server) handleMCPProtocolToolsList(c *gin.Context, req *types.MCPReques
 			},
 		},
 		{
+			"name":        "mouse_click",
+			"description": "Click the mouse at screen-absolute coordinates, or at coordinates relative to a window's client area. Optionally bring the window to the foreground first.",
+			"inputSchema": map[string]interface{}{
+				"type": "object",
+				"properties": map[string]interface{}{
+					"x": map[string]interface{}{
+						"type":        "integer",
+						"description": "X coordinate in pixels",
+					},
+					"y": map[string]interface{}{
+						"type":        "integer",
+						"description": "Y coordinate in pixels",
+					},
+					"button": map[string]interface{}{
+						"type":        "string",
+						"enum":        []string{"left", "right", "middle"},
+						"default":     "left",
+						"description": "Mouse button to click",
+					},
+					"click_type": map[string]interface{}{
+						"type":        "string",
+						"enum":        []string{"single", "double"},
+						"default":     "single",
+						"description": "Single or double click",
+					},
+					"window_title": map[string]interface{}{
+						"type":        "string",
+						"description": "If provided, x/y are relative to this window's client area and the window is brought to the foreground first",
+					},
+				},
+				"required": []string{"x", "y"},
+			},
+		},
+		{
 			"name":        "control_window",
 			"description": "Control a window's state, position, or size. Actions: restore, maximize, minimize, focus, move, resize, move_resize.",
 			"inputSchema": map[string]interface{}{
@@ -1139,6 +1173,8 @@ func (s *Server) handleMCPProtocolToolsCall(c *gin.Context, req *types.MCPReques
 		s.mcpToolListWindows(c, req)
 	case "control_window":
 		s.mcpToolControlWindow(c, req, args)
+	case "mouse_click":
+		s.mcpToolMouseClick(c, req, args)
 	default:
 		s.sendMCPError(c, req.ID, -32602, fmt.Sprintf("Unknown tool: %s", toolName), nil)
 	}
@@ -1411,6 +1447,59 @@ func (s *Server) mcpToolControlWindow(c *gin.Context, req *types.MCPRequest, arg
 					info.Title, action, info.State,
 					info.Rect.Width, info.Rect.Height,
 					info.Rect.X, info.Rect.Y),
+			},
+		},
+	})
+}
+
+func (s *Server) mcpToolMouseClick(c *gin.Context, req *types.MCPRequest, args map[string]interface{}) {
+	x := getInt(args, "x", 0)
+	y := getInt(args, "y", 0)
+	button := getString(args, "button", "left")
+	clickType := getString(args, "click_type", "single")
+	windowTitle := getString(args, "window_title", "")
+
+	var windowHandle uintptr
+	if windowTitle != "" {
+		handle, err := s.engine.FindWindowHandle("title", windowTitle)
+		if err != nil {
+			s.sendMCPResult(c, req.ID, map[string]interface{}{
+				"isError": true,
+				"content": []map[string]interface{}{
+					{"type": "text", "text": fmt.Sprintf("Window not found: %s", err.Error())},
+				},
+			})
+			return
+		}
+		windowHandle = handle
+
+		// Bring window to foreground before clicking
+		s.engine.ControlWindow(handle, "focus", 0, 0, 0, 0)
+		time.Sleep(200 * time.Millisecond)
+	}
+
+	err := s.engine.ClickMouse(x, y, button, clickType, windowHandle)
+	if err != nil {
+		s.sendMCPResult(c, req.ID, map[string]interface{}{
+			"isError": true,
+			"content": []map[string]interface{}{
+				{"type": "text", "text": fmt.Sprintf("Mouse click failed: %s", err.Error())},
+			},
+		})
+		return
+	}
+
+	coordDesc := fmt.Sprintf("screen (%d,%d)", x, y)
+	if windowTitle != "" {
+		coordDesc = fmt.Sprintf("window '%s' client (%d,%d)", windowTitle, x, y)
+	}
+
+	s.sendMCPResult(c, req.ID, map[string]interface{}{
+		"content": []map[string]interface{}{
+			{
+				"type": "text",
+				"text": fmt.Sprintf("%s %s-click at %s",
+					button, clickType, coordDesc),
 			},
 		},
 	})

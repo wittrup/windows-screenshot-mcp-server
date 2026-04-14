@@ -43,6 +43,13 @@ var (
 	setForegroundWindow   = user32.NewProc("SetForegroundWindow")
 	moveWindow            = user32.NewProc("MoveWindow")
 	setWindowPos          = user32.NewProc("SetWindowPos")
+
+	// Mouse / keyboard input functions
+	setCursorPos          = user32.NewProc("SetCursorPos")
+	getCursorPos          = user32.NewProc("GetCursorPos")
+	sendInput             = user32.NewProc("SendInput")
+	clientToScreen        = user32.NewProc("ClientToScreen")
+	getSystemMetrics      = user32.NewProc("GetSystemMetrics")
 	
 	// GDI32 functions
 	createCompatibleDC    = gdi32.NewProc("CreateCompatibleDC")
@@ -811,6 +818,66 @@ func (e *WindowsScreenshotEngine) FindWindowByPIDPublic(pid uint32) (uintptr, er
 	return e.findWindowByPID(pid)
 }
 
+// ClickMouse performs a mouse click at screen-absolute or window-relative coordinates.
+// button: "left", "right", "middle"
+// clickType: "single", "double"
+// If windowHandle != 0 the x,y are relative to the window's client area.
+func (e *WindowsScreenshotEngine) ClickMouse(x, y int, button, clickType string, windowHandle uintptr) error {
+	// Convert window-relative to screen-absolute if needed
+	screenX, screenY := int32(x), int32(y)
+	if windowHandle != 0 {
+		pt := POINT{X: int32(x), Y: int32(y)}
+		ret, _, _ := clientToScreen.Call(windowHandle, uintptr(unsafe.Pointer(&pt)))
+		if ret == 0 {
+			return fmt.Errorf("ClientToScreen failed")
+		}
+		screenX, screenY = pt.X, pt.Y
+	}
+
+	// Move cursor
+	ret, _, _ := setCursorPos.Call(uintptr(screenX), uintptr(screenY))
+	if ret == 0 {
+		return fmt.Errorf("SetCursorPos failed")
+	}
+	time.Sleep(50 * time.Millisecond)
+
+	// Determine button flags
+	var downFlag, upFlag uint32
+	switch button {
+	case "right":
+		downFlag, upFlag = MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP
+	case "middle":
+		downFlag, upFlag = MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP
+	default: // "left"
+		downFlag, upFlag = MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP
+	}
+
+	clicks := 1
+	if clickType == "double" {
+		clicks = 2
+	}
+
+	for i := 0; i < clicks; i++ {
+		// Mouse down
+		inputDown := INPUT{Type: INPUT_MOUSE}
+		inputDown.Mi.DwFlags = downFlag
+		sendInput.Call(1, uintptr(unsafe.Pointer(&inputDown)), unsafe.Sizeof(inputDown))
+
+		time.Sleep(20 * time.Millisecond)
+
+		// Mouse up
+		inputUp := INPUT{Type: INPUT_MOUSE}
+		inputUp.Mi.DwFlags = upFlag
+		sendInput.Call(1, uintptr(unsafe.Pointer(&inputUp)), unsafe.Sizeof(inputUp))
+
+		if i < clicks-1 {
+			time.Sleep(50 * time.Millisecond)
+		}
+	}
+
+	return nil
+}
+
 // Ensure we implement the interface
 var _ types.ScreenshotEngine = (*WindowsScreenshotEngine)(nil)
 
@@ -826,7 +893,42 @@ const (
 	SWP_NOMOVE       = 0x0002
 	SWP_NOSIZE       = 0x0001
 	HWND_TOP         = 0
+
+	// SendInput / mouse constants
+	INPUT_MOUSE           = 0
+	MOUSEEVENTF_MOVE      = 0x0001
+	MOUSEEVENTF_LEFTDOWN  = 0x0002
+	MOUSEEVENTF_LEFTUP    = 0x0004
+	MOUSEEVENTF_RIGHTDOWN = 0x0008
+	MOUSEEVENTF_RIGHTUP   = 0x0010
+	MOUSEEVENTF_MIDDLEDOWN = 0x0020
+	MOUSEEVENTF_MIDDLEUP  = 0x0040
+	MOUSEEVENTF_ABSOLUTE  = 0x8000
+	SM_CXSCREEN           = 0
+	SM_CYSCREEN           = 1
 )
+
+// POINT structure for GetCursorPos
+type POINT struct {
+	X, Y int32
+}
+
+// MOUSEINPUT for SendInput
+type MOUSEINPUT struct {
+	Dx          int32
+	Dy          int32
+	MouseData   uint32
+	DwFlags     uint32
+	Time        uint32
+	DwExtraInfo uintptr
+}
+
+// INPUT structure for SendInput (mouse variant)
+type INPUT struct {
+	Type uint32
+	_    [4]byte // padding on 64-bit
+	Mi   MOUSEINPUT
+}
 
 func init() {
 	// Lock OS thread for Windows API calls

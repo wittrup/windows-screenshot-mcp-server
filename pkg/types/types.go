@@ -197,6 +197,9 @@ type ScreenshotEngine interface {
 	ControlWindow(handle uintptr, action string, x, y, width, height int) (*WindowInfo, error)
 	FindWindowHandle(method, target string) (uintptr, error)
 	FindWindowByPIDPublic(pid uint32) (uintptr, error)
+
+	// Input simulation
+	ClickMouse(x, y int, button, clickType string, windowHandle uintptr) error
 }
 
 // WindowManager defines window management operations
