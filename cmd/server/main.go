@@ -1147,6 +1147,42 @@ func (s *Server) handleMCPProtocolToolsList(c *gin.Context, req *types.MCPReques
 				"required": []string{"method", "target", "action"},
 			},
 		},
+		{
+			"name":        "type_text",
+			"description": "Type a string as unicode keystrokes into the focused control (newline = Enter). Click the target field first with mouse_click.",
+			"inputSchema": map[string]interface{}{
+				"type": "object",
+				"properties": map[string]interface{}{
+					"text": map[string]interface{}{
+						"type":        "string",
+						"description": "Text to type",
+					},
+					"window_handle": map[string]interface{}{
+						"type":        "string",
+						"description": "Window handle number from list_windows. If provided, the window is brought to the foreground first.",
+					},
+				},
+				"required": []string{"text"},
+			},
+		},
+		{
+			"name":        "send_keys",
+			"description": "Press a space-separated sequence of keys or combos, e.g. \"ctrl+a delete\", \"alt+f\", \"tab tab enter\", \"esc\", \"f5\". Modifiers: ctrl, alt, shift, win.",
+			"inputSchema": map[string]interface{}{
+				"type": "object",
+				"properties": map[string]interface{}{
+					"keys": map[string]interface{}{
+						"type":        "string",
+						"description": "Keys to press",
+					},
+					"window_handle": map[string]interface{}{
+						"type":        "string",
+						"description": "Window handle number from list_windows. If provided, the window is brought to the foreground first.",
+					},
+				},
+				"required": []string{"keys"},
+			},
+		},
 	}
 
 	result := map[string]interface{}{
@@ -1179,6 +1215,8 @@ func (s *Server) handleMCPProtocolToolsCall(c *gin.Context, req *types.MCPReques
 		s.mcpToolControlWindow(c, req, args)
 	case "mouse_click":
 		s.mcpToolMouseClick(c, req, args)
+	case "type_text", "send_keys":
+		s.mcpToolKeyboard(c, req, toolName, args)
 	default:
 		s.sendMCPError(c, req.ID, -32602, fmt.Sprintf("Unknown tool: %s", toolName), nil)
 	}
@@ -1519,6 +1557,50 @@ func (s *Server) mcpToolMouseClick(c *gin.Context, req *types.MCPRequest, args m
 				"text": fmt.Sprintf("%s %s-click at %s",
 					button, clickType, coordDesc),
 			},
+		},
+	})
+}
+
+func (s *Server) mcpToolKeyboard(c *gin.Context, req *types.MCPRequest, toolName string, args map[string]interface{}) {
+	var windowHandle uintptr
+	if h := getString(args, "window_handle", ""); h != "" {
+		parsed, err := strconv.ParseUint(h, 10, 64)
+		if err != nil {
+			s.sendMCPResult(c, req.ID, map[string]interface{}{
+				"isError": true,
+				"content": []map[string]interface{}{
+					{"type": "text", "text": fmt.Sprintf("Invalid handle: %s", h)},
+				},
+			})
+			return
+		}
+		windowHandle = uintptr(parsed)
+	}
+
+	var err error
+	var desc string
+	if toolName == "type_text" {
+		text := getString(args, "text", "")
+		err = s.engine.TypeText(text, windowHandle)
+		desc = fmt.Sprintf("Typed %d characters", len([]rune(text)))
+	} else {
+		keys := getString(args, "keys", "")
+		err = s.engine.SendKeys(keys, windowHandle)
+		desc = fmt.Sprintf("Sent keys: %s", keys)
+	}
+	if err != nil {
+		s.sendMCPResult(c, req.ID, map[string]interface{}{
+			"isError": true,
+			"content": []map[string]interface{}{
+				{"type": "text", "text": fmt.Sprintf("%s failed: %s", toolName, err.Error())},
+			},
+		})
+		return
+	}
+
+	s.sendMCPResult(c, req.ID, map[string]interface{}{
+		"content": []map[string]interface{}{
+			{"type": "text", "text": desc},
 		},
 	})
 }

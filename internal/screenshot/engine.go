@@ -845,6 +845,14 @@ func (e *WindowsScreenshotEngine) FindWindowByPIDPublic(pid uint32) (uintptr, er
 // directly to the window — does NOT move the physical cursor (stealth/non-interfering).
 // When windowHandle == 0, falls back to SetCursorPos + SendInput (screen-absolute).
 func (e *WindowsScreenshotEngine) ClickMouse(x, y int, button, clickType string, windowHandle uintptr) error {
+	target := windowHandle
+	if target == 0 {
+		target = windowAtScreenPoint(x, y)
+	}
+	if err := checkInputAllowed(target); err != nil {
+		return err
+	}
+
 	if windowHandle != 0 {
 		// Qt ignores PostMessage-based synthetic clicks — its input system
 		// requires real hardware events.  Detect Qt windows and use

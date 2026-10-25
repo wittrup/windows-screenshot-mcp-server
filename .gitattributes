@@ -1,0 +1,12 @@
+# Line endings are decided here, not by each machine's core.autocrlf.
+# This project is developed on Windows and deployed to Linux, so everything
+# text is stored AND checked out as LF — including on Windows. Node, Git Bash
+# and PowerShell 5.1 all read LF happily, and a shell script can never acquire
+# a CRLF shebang (`#!/bin/bash\r`), which Linux refuses to execute.
+
+* text=auto eol=lf
+
+# Windows-only tooling: keep CRLF locally so Notepad/ISE behave, but the repo
+# still stores LF.
+*.bat   text eol=crlf
+*.cmd   text eol=crlf

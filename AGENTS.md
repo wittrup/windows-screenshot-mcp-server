@@ -79,3 +79,7 @@ After exploration, document:
 - **Use `capture_desktop`** when you need to see where windows are positioned relative to each other.
 - **Window class names** reveal the framework: `Qt5*` = Qt, `Chrome_WidgetWin_1` = Electron/Chrome, `Afx:*` = MFC, `CabinetWClass` = File Explorer.
 - The MCP server runs at `http://127.0.0.1:8080/mcp` (Streamable HTTP transport, JSON-RPC 2.0).
+
+## Input tools and elevated applications
+- `type_text` types unicode text into the focused control (click the field first); `send_keys` presses combos such as `"ctrl+a delete"`, `"alt+f"`, `"tab tab enter"`.
+- Windows UIPI blocks injected input (SendInput/PostMessage) into processes running at a **higher integrity level** (for example apps set to "Run as administrator"). Screenshots still work. `mouse_click`, `type_text` and `send_keys` detect this and return an error naming both integrity levels. Fix it by running the server elevated or by starting the target without elevation.

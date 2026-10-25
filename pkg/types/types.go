@@ -200,6 +200,8 @@ type ScreenshotEngine interface {
 
 	// Input simulation
 	ClickMouse(x, y int, button, clickType string, windowHandle uintptr) error
+	TypeText(text string, windowHandle uintptr) error
+	SendKeys(keys string, windowHandle uintptr) error
 }
 
 // WindowManager defines window management operations
